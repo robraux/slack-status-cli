@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""
+Slack Status CLI - Update Slack presence, status, and DND across multiple workspaces
+"""
+
+import argparse
+import json
+import logging
+import os
+import sys
+from typing import Dict, List, Optional, Union
+
+try:
+    import yaml
+    HAS_YAML = True
+except ImportError:
+    HAS_YAML = False
+
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
+
+def setup_logging(verbose: bool = False) -> None:
+    """Configure logging based on verbosity level."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(levelname)s: %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
+
+
+def load_tokens_from_env() -> List[str]:
+    """Load Slack tokens from SLACK_TOKENS environment variable."""
+    tokens_str = os.getenv('SLACK_TOKENS', '')
+    if not tokens_str:
+        return []
+    
+    # Split by comma and strip whitespace
+    tokens = [token.strip() for token in tokens_str.split(',') if token.strip()]
+    return tokens
+
+
+def load_tokens_from_config(config_path: str) -> List[str]:
+    """Load Slack tokens from configuration file (JSON or YAML)."""
+    if not os.path.exists(config_path):
+        logging.error(f"Config file not found: {config_path}")
+        return []
+    
+    try:
+        with open(config_path, 'r') as f:
+            if config_path.endswith('.yaml') or config_path.endswith('.yml'):
+                if not HAS_YAML:
+                    logging.error("YAML support not available. Install PyYAML: pip install pyyaml")
+                    return []
+                config = yaml.safe_load(f)
+            else:
+                config = json.load(f)
+        
+        tokens = config.get('tokens', [])
+        if not isinstance(tokens, list):
+            logging.error("Config file must contain a 'tokens' array")
+            return []
+        
+        return tokens
+    
+    except (json.JSONDecodeError, yaml.YAMLError) as e:
+        logging.error(f"Error parsing config file: {e}")
+        return []
+    except Exception as e:
+        logging.error(f"Error reading config file: {e}")
+        return []
+
+
+def load_all_tokens(config_path: Optional[str] = None) -> List[str]:
+    """Load tokens from both environment and config file, combining them."""
+    env_tokens = load_tokens_from_env()
+    config_tokens = []
+    
+    # Use provided config path, or check for default config files
+    if config_path:
+        config_tokens = load_tokens_from_config(config_path)
+    else:
+        # Get the directory where this script is located
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Check for default config files in order of preference
+        default_configs = ['config.json', 'config.yml', 'config.yaml']
+        for default_config in default_configs:
+            config_file_path = os.path.join(script_dir, default_config)
+            if os.path.exists(config_file_path):
+                logging.debug(f"Found default config file: {config_file_path}")
+                config_tokens = load_tokens_from_config(config_file_path)
+                if config_tokens:
+                    break
+    
+    # Combine and deduplicate tokens
+    all_tokens = list(set(env_tokens + config_tokens))
+    
+    if not all_tokens:
+        logging.error("No Slack tokens found. Set SLACK_TOKENS env var or provide config file.")
+        return []
+    
+    logging.info(f"Found {len(all_tokens)} unique token(s)")
+    return all_tokens
+
+
+def set_presence(client: WebClient, presence: str, dry_run: bool = False) -> bool:
+    """Set Slack presence (auto/away)."""
+    if dry_run:
+        logging.info(f"[DRY RUN] Would set presence to: {presence}")
+        return True
+    
+    try:
+        response = client.users_setPresence(presence=presence)
+        if response["ok"]:
+            logging.debug(f"Presence set to: {presence}")
+            return True
+        else:
+            logging.error(f"Failed to set presence: {response.get('error', 'Unknown error')}")
+            return False
+    except SlackApiError as e:
+        logging.error(f"API error setting presence: {e.response['error']}")
+        return False
+
+
+def set_status(client: WebClient, text: Optional[str] = None, 
+               emoji: Optional[str] = None, expiration: int = 0, dry_run: bool = False) -> bool:
+    """Set Slack status message and emoji."""
+    profile = {}
+    
+    if text is not None:
+        profile['status_text'] = text
+    if emoji is not None:
+        profile['status_emoji'] = emoji
+    if text is None and emoji is None:
+        # Clear status
+        profile['status_text'] = ''
+        profile['status_emoji'] = ''
+    
+    profile['status_expiration'] = expiration
+    
+    if dry_run:
+        logging.info(f"[DRY RUN] Would set status: {profile}")
+        return True
+    
+    try:
+        response = client.users_profile_set(profile=profile)
+        if response["ok"]:
+            if text or emoji:
+                logging.debug(f"Status updated: {text} {emoji}")
+            else:
+                logging.debug("Status cleared")
+            return True
+        else:
+            logging.error(f"Failed to set status: {response.get('error', 'Unknown error')}")
+            return False
+    except SlackApiError as e:
+        logging.error(f"API error setting status: {e.response['error']}")
+        return False
+
+
+def set_dnd(client: WebClient, minutes: Optional[int] = None, 
+            disable: bool = False, dry_run: bool = False) -> bool:
+    """Enable or disable Do Not Disturb."""
+    if disable:
+        if dry_run:
+            logging.info("[DRY RUN] Would disable DND")
+            return True
+        
+        try:
+            response = client.dnd_endDnd()
+            if response["ok"]:
+                logging.debug("DND disabled")
+                return True
+            else:
+                logging.error(f"Failed to disable DND: {response.get('error', 'Unknown error')}")
+                return False
+        except SlackApiError as e:
+            logging.error(f"API error disabling DND: {e.response['error']}")
+            return False
+    
+    elif minutes is not None:
+        if dry_run:
+            logging.info(f"[DRY RUN] Would enable DND for {minutes} minutes")
+            return True
+        
+        try:
+            response = client.dnd_setSnooze(num_minutes=minutes)
+            if response["ok"]:
+                logging.debug(f"DND enabled for {minutes} minutes")
+                return True
+            else:
+                logging.error(f"Failed to enable DND: {response.get('error', 'Unknown error')}")
+                return False
+        except SlackApiError as e:
+            logging.error(f"API error enabling DND: {e.response['error']}")
+            return False
+    
+    # No DND action requested
+    return True
+
+
+def process_workspace(token: str, workspace_idx: int, args) -> bool:
+    """Process a single workspace with the given token."""
+    logging.info(f"Processing workspace {workspace_idx + 1}/{len(tokens)}")
+    
+    client = WebClient(token=token)
+    success = True
+    
+    # Set presence
+    if not set_presence(client, args.presence, args.dry_run):
+        success = False
+    
+    # Set status
+    if not set_status(client, args.status_text, args.status_emoji, 
+                     args.status_expiration, args.dry_run):
+        success = False
+    
+    # Handle DND
+    if not set_dnd(client, args.dnd_on, args.dnd_off, args.dry_run):
+        success = False
+    
+    return success
+
+
+def main() -> None:
+    """Main CLI entry point."""
+    parser = argparse.ArgumentParser(
+        description="Update Slack presence, status, and DND across multiple workspaces",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --status-text "In a meeting" --status-emoji ":calendar:" --dnd-on 60
+  %(prog)s --presence away --dnd-off
+  %(prog)s --dry-run --verbose
+  %(prog)s --config config.json --status-text "Working from home" --status-expiration 480
+
+Configuration:
+  Tokens can be provided via:
+  - SLACK_TOKENS environment variable (comma-separated)
+  - Config file with {"tokens": ["xoxp-...", "xoxp-..."]}
+        """)
+    
+    parser.add_argument('--status-text', 
+                       help='Status message text')
+    parser.add_argument('--status-emoji', 
+                       help='Status emoji (e.g., :coffee:)')
+    parser.add_argument('--status-expiration', type=int, default=0,
+                       help='Status expiration in minutes (0 = never, default: 0)')
+    parser.add_argument('--presence', choices=['auto', 'away'], default='auto',
+                       help='Set presence (default: auto)')
+    parser.add_argument('--dnd-on', type=int, metavar='MINUTES',
+                       help='Enable DND for specified minutes')
+    parser.add_argument('--dnd-off', action='store_true',
+                       help='Disable DND')
+    parser.add_argument('--config',
+                       help='Path to config file (JSON or YAML)')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Preview actions without executing them')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Enable verbose logging')
+    
+    args = parser.parse_args()
+    
+    # Validate DND options
+    if args.dnd_on is not None and args.dnd_off:
+        parser.error("Cannot specify both --dnd-on and --dnd-off")
+    
+    # Setup logging
+    setup_logging(args.verbose)
+    
+    # Load tokens
+    global tokens
+    tokens = load_all_tokens(args.config)
+    if not tokens:
+        sys.exit(1)
+    
+    # Process each workspace
+    overall_success = True
+    for i, token in enumerate(tokens):
+        try:
+            if not process_workspace(token, i, args):
+                overall_success = False
+        except Exception as e:
+            logging.error(f"Unexpected error processing workspace {i + 1}: {e}")
+            overall_success = False
+    
+    if args.dry_run:
+        logging.info("Dry run completed")
+    elif overall_success:
+        logging.info("All workspaces updated successfully")
+    else:
+        logging.warning("Some workspaces failed to update")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
